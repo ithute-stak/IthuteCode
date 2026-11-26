@@ -103,3 +103,26 @@ class JobQueue:
             if row is None:
                 raise KeyError(job_id)
             return dict(row)
+
+    def active(self, job_id, lease):
+        with self.transaction() as db:
+            return db.execute("""SELECT 1 FROM coding_jobs WHERE id=? AND lease=?
+                AND status='running' AND expires>?""", (job_id,lease,self.clock())).fetchone() is not None
+
+    def defer(self, job_id, lease):
+        """Return an untouched job to the queue; only before any side effect."""
+        with self.transaction() as db:
+            changed = db.execute("""UPDATE coding_jobs SET status='queued',lease=NULL,expires=NULL
+                WHERE id=? AND lease=? AND status='running' AND expires>?""",
+                (job_id,lease,self.clock())).rowcount
+            if changed != 1:
+                raise PermissionError("Invalid or expired execution lease")
+
+    def mark_uncertain(self, job_id, lease):
+        """Freeze project execution when an external outcome is unknown."""
+        with self.transaction() as db:
+            changed = db.execute("""UPDATE coding_jobs SET status='uncertain'
+                WHERE id=? AND lease=? AND status IN ('running','uncertain')""",
+                (job_id,lease)).rowcount
+            if changed != 1:
+                raise PermissionError("Invalid execution lease")
