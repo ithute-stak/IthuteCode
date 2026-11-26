@@ -10,7 +10,7 @@ from .agent import INSTRUCTIONS
 
 class SessionManager:
     def __init__(self, checkpoints, provider, verify_head, count_tokens,
-                 context_limit, *, overhead_tokens=1024):
+                 context_limit, *, overhead_tokens=1024, budget=None, claimed_job=None):
         if type(context_limit) is not int or context_limit <= 0:
             raise ValueError("Invalid context limit")
         if type(overhead_tokens) is not int or not 0 <= overhead_tokens < context_limit:
@@ -22,12 +22,24 @@ class SessionManager:
         self.count_tokens = count_tokens
         self.context_limit = context_limit
         self.overhead_tokens = overhead_tokens
+        self.budget = budget
+        self.claimed_job = claimed_job
+        if (budget is None) != (claimed_job is None):
+            raise ValueError("Budget and trusted job resolver must be configured together")
+        if budget is not None:
+            from pathlib import Path
+            if Path(budget.queue.path).resolve() != Path(self.store.path).resolve():
+                raise ValueError("Budget and sessions must share database")
         with self.store.transaction() as db:
             db.execute("""CREATE TABLE IF NOT EXISTS ai_sessions (
                 id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id),
                 sha TEXT NOT NULL, request_digest TEXT NOT NULL,
                 input_tokens INTEGER NOT NULL, output_limit INTEGER NOT NULL,
                 status TEXT NOT NULL
+            )""")
+            db.execute("""CREATE TABLE IF NOT EXISTS ai_session_budget_links (
+                session_id TEXT PRIMARY KEY REFERENCES ai_sessions(id),
+                job_id TEXT NOT NULL UNIQUE REFERENCES ai_reservations(job_id)
             )""")
             db.execute("""CREATE UNIQUE INDEX IF NOT EXISTS one_uncertain_ai_session
                 ON ai_sessions(project_id) WHERE status IN ('started','uncertain')""")
@@ -78,6 +90,7 @@ class SessionManager:
         digest = hashlib.sha256((effective+"\n"+data).encode()).hexdigest()
         if not self.verify_head(project,sha):
             raise PermissionError("Repository head changed")
+        claimed = self.claimed_job(project,sha) if self.budget is not None else None
         with self.store.transaction() as db:
             row = db.execute("SELECT paused FROM projects WHERE id=?",(project,)).fetchone()
             if row is None or row["paused"]:
@@ -86,6 +99,21 @@ class SessionManager:
                 raise RuntimeError("Previous AI request requires reconciliation")
             db.execute("INSERT INTO ai_sessions VALUES (?,?,?,?,?,?,'started')",
                        (session,project,sha,digest,count,max_output_tokens))
+            if self.budget is not None:
+                if not isinstance(claimed,dict) or claimed.get('project_id') != project:
+                    raise PermissionError("Budget job identity mismatch")
+                reservation = db.execute("""SELECT r.actual,j.payload FROM ai_reservations r
+                    JOIN coding_jobs j ON j.id=r.job_id WHERE r.job_id=? AND r.project_id=?
+                    AND j.project_id=? AND j.lease=? AND j.status='running' AND j.expires>?""",
+                    (claimed['id'],project,project,claimed['lease'],self.budget.queue.clock())).fetchone()
+                if reservation is None or reservation['actual'] is not None:
+                    raise PermissionError("Active unsettled reservation required")
+                decision = json.loads(reservation['payload'])['decision']
+                if decision['project_id'] != project or decision['sha'] != sha:
+                    raise PermissionError("Reservation baseline mismatch")
+                if db.execute("SELECT 1 FROM ai_session_budget_links WHERE job_id=?",(claimed['id'],)).fetchone():
+                    raise PermissionError("Reservation already linked to an AI request")
+                db.execute("INSERT INTO ai_session_budget_links VALUES (?,?)",(session,claimed['id']))
         try:
             result = self.provider.propose(effective,data,max_output_tokens)
             if not isinstance(result,str) or not result.strip():
