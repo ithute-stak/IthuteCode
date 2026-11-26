@@ -68,3 +68,34 @@ class GitTransport:
         if observed.split() != [commit_sha, ref]:
             raise RuntimeError("Remote publication uncertain")
         return commit_sha
+
+    def initialize_branch(self, repository_id, branch, baseline_sha, authorize):
+        """Create only an absent development ref; resume only at exact baseline."""
+        if type(repository_id) is not int or repository_id != self.repository_id:
+            raise PermissionError("Repository identity mismatch")
+        if not isinstance(branch, str) or not re.fullmatch(
+            r"ithutecode/[a-z0-9][a-z0-9-]{0,79}", branch
+        ):
+            raise PermissionError("Dedicated development branch required")
+        if not isinstance(baseline_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", baseline_sha):
+            raise ValueError("Invalid baseline SHA")
+        if not authorize(repository_id, branch, baseline_sha):
+            raise PermissionError("Branch initialization not authorized")
+        if self._git("rev-parse", "HEAD") != baseline_sha:
+            raise ValueError("Checkout baseline mismatch")
+        if self._git("symbolic-ref", "--short", "HEAD") != branch:
+            raise PermissionError("Unexpected local branch")
+        ref = "refs/heads/" + branch
+        observed = self._git("ls-remote", "--refs", "--", self.remote, ref)
+        if observed:
+            if observed.split() == [baseline_sha, ref]:
+                return baseline_sha
+            raise RuntimeError("Remote branch already exists at another commit")
+        if not authorize(repository_id, branch, baseline_sha):
+            raise PermissionError("Branch initialization authorization withdrawn")
+        self._git("push", "--no-follow-tags", "--force-with-lease=" + ref + ":",
+                  "--", self.remote, baseline_sha + ":" + ref)
+        observed = self._git("ls-remote", "--refs", "--", self.remote, ref)
+        if observed.split() != [baseline_sha, ref]:
+            raise RuntimeError("Branch initialization uncertain; reconcile before retry")
+        return baseline_sha
