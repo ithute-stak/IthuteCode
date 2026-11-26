@@ -23,6 +23,9 @@ class Milestones:
             )""")
 
     def record(self, claimed, publication, ordinal):
+        return self._record(claimed, publication, ordinal, recovery=False)
+
+    def _record(self, claimed, publication, ordinal, *, recovery):
         if type(ordinal) is not int or ordinal < 0:
             raise ValueError("Invalid task ordinal")
         project = publication.project_id
@@ -32,9 +35,11 @@ class Milestones:
         if not self.verify_head(publication.repository_id, publication.branch, sha):
             raise PermissionError("Remote head mismatch")
         with self.store.transaction() as db:
-            row = db.execute("""SELECT project_id,payload FROM coding_jobs
-                WHERE id=? AND lease=? AND status='running' AND expires>?""",
-                (claimed["id"],claimed["lease"],self.queue.clock())).fetchone()
+            row = db.execute("""SELECT project_id,payload,status,expires FROM coding_jobs
+                WHERE id=? AND lease=?""", (claimed["id"],claimed["lease"])).fetchone()
+            if row is not None and (row["status"] != ("uncertain" if recovery else "running") or
+                (not recovery and row["expires"] <= self.queue.clock())):
+                row = None
             if row is None or row["project_id"] != project:
                 raise PermissionError("Milestone lease invalid")
             decision = json.loads(row["payload"])["decision"]
@@ -43,14 +48,18 @@ class Milestones:
             journal = db.execute("SELECT * FROM publication_journal WHERE job_id=?",
                                  (claimed["id"],)).fetchone()
             from dataclasses import asdict
-            if journal is None or journal["status"] != "published" or journal["project_id"] != project or json.loads(journal["publication"]) != asdict(publication):
+            if journal is None or journal["status"] not in (("intent","published") if recovery else ("published",)) or journal["project_id"] != project or json.loads(journal["publication"]) != asdict(publication):
                 raise PermissionError("Confirmed publication required")
+            if recovery:
+                db.execute("UPDATE publication_journal SET status='published' WHERE job_id=?", (claimed["id"],))
             task = self.store._active(db,project,ordinal)
             old = db.execute("SELECT * FROM publication_milestones WHERE job_id=?",
                              (claimed["id"],)).fetchone()
             if old:
                 if (old["project_id"],old["ordinal"],old["sha"],task["candidate_sha"]) != (project,ordinal,sha,sha):
                     raise PermissionError("Conflicting milestone")
+                if recovery:
+                    self._finish_recovery(db,claimed,sha)
                 return old["sequence"]
             if task["candidate_sha"] not in (None,publication.baseline_sha):
                 raise PermissionError("Stale task baseline")
@@ -67,4 +76,14 @@ class Milestones:
                        (project,seq,sha,payload,hashlib.sha256(payload.encode()).hexdigest()))
             db.execute("INSERT INTO publication_milestones VALUES (?,?,?,?,?)",
                        (claimed["id"],project,ordinal,sha,seq))
+            if recovery:
+                self._finish_recovery(db,claimed,sha)
             return seq
+
+    @staticmethod
+    def _finish_recovery(db, claimed, sha):
+        changed = db.execute("""UPDATE coding_jobs SET status='completed',lease=NULL,expires=NULL,result=?
+            WHERE id=? AND lease=? AND status='uncertain'""",
+            (json.dumps({"outcome":"recovered_publication","commit_sha":sha}),claimed["id"],claimed["lease"])).rowcount
+        if changed != 1:
+            raise PermissionError("Recovery lease changed")
