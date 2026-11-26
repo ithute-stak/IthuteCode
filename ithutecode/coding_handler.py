@@ -12,10 +12,11 @@ class CodingPlan:
     repository_id: int
     remote: str
     job: CodingJob
+    ordinal: int | None = None
 
 class CodingHandler:
     def __init__(self, parent, agent, resolve_plan, reserve_budget,
-                 verify_commit, journal, token_provider=None, *, local_test=False):
+                 verify_commit, journal, token_provider=None, *, local_test=False, milestones=None):
         self.parent = parent
         self.agent = agent
         self.resolve_plan = resolve_plan
@@ -24,6 +25,7 @@ class CodingHandler:
         self.journal = journal
         self.token_provider = token_provider
         self.local_test = local_test
+        self.milestones = milestones
 
     def __call__(self, claimed, guard):
         guard()
@@ -36,6 +38,8 @@ class CodingHandler:
             raise PermissionError("Unexpected coding mode")
         if req.project_id != claimed["project_id"] or req.candidate_sha != decision["sha"]:
             raise PermissionError("Stale or mismatched coding plan")
+        if self.milestones is not None and (type(plan.ordinal) is not int or plan.ordinal < 0):
+            raise ValueError("Active task ordinal required")
         guard()
         with provision(self.parent, plan.remote, req.candidate_sha, job.branch,
                        local_test=self.local_test, repository_id=plan.repository_id,
@@ -59,4 +63,7 @@ class CodingHandler:
                                   lambda p: self.verify_commit(root, p, job)).publish(publication)
             guard()
             self.journal.record_published(claimed, publication)
+            if self.milestones is not None:
+                guard()
+                self.milestones.record(claimed, publication, plan.ordinal)
             return {"outcome":"published", "commit_sha":published, "branch":job.branch}
