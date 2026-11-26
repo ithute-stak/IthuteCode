@@ -7,15 +7,19 @@ import os
 import re
 import subprocess
 from pathlib import Path
+from .git_credentials import credential_environment
 
 class GitTransport:
-    def __init__(self, root, repository_id, remote, *, local_test=False):
+    def __init__(self, root, repository_id, remote, *, local_test=False, token_provider=None):
         self.root = Path(root).resolve(strict=True)
         if type(repository_id) is not int or repository_id <= 0:
             raise ValueError("Invalid repository identity")
         if not (self.root / ".git").is_dir() or (self.root / ".git").is_symlink():
             raise ValueError("Standalone checkout required")
         self.repository_id = repository_id
+        if local_test and token_provider is not None:
+            raise ValueError("Credentials forbidden for local remotes")
+        self.token_provider = token_provider
         if local_test:
             self.remote = str(Path(remote).resolve(strict=True))
             self.protocol = "file"
@@ -31,6 +35,8 @@ class GitTransport:
         env = {"PATH": os.defpath, "LANG": "C", "GIT_CONFIG_NOSYSTEM": "1",
                "GIT_CONFIG_GLOBAL": os.devnull, "GIT_TERMINAL_PROMPT": "0",
                "GIT_ALLOW_PROTOCOL": self.protocol}
+        if self.token_provider is not None and args[0] in {"push", "ls-remote"}:
+            env.update(credential_environment(self.repository_id, self.remote, self.token_provider))
         return subprocess.run(
             ["git", "-c", "core.hooksPath=" + os.devnull,
              "-c", "core.fsmonitor=false", "-c", "http.followRedirects=false",
